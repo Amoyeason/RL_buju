@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# VSCode
+.vscode/
+
+# Logs
+logs_*/
+*.log
+
+# Ansys 临时文件
+ansys_*/
+*.out
+*.db
+*.err
+*.rst
+
+# 模型文件（太大）
+*.zip
+
+# 图片（可选）
+*.png
