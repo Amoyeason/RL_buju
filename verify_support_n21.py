@@ -1215,6 +1215,8 @@ def solve_python_support_plus_21(env, support_points, locator2_points, locator1_
         "uy": uy,
         "uz": uz,
         "usum": usum,
+        "max_abs_ux_mm": float(np.max(np.abs(ux)) * 1000.0),
+        "max_abs_uy_mm": float(np.max(np.abs(uy)) * 1000.0),
         "max_abs_uz_mm": float(np.max(np.abs(uz)) * 1000.0),
         "max_usum_mm": float(np.max(usum) * 1000.0),
         "support_patch_node_count": len(support_node_ids),
@@ -1222,8 +1224,19 @@ def solve_python_support_plus_21(env, support_points, locator2_points, locator1_
         "locator1_node_id_python": locator1_node_idx,
     }
 
+    two_dof = locator_meta["two_dof"]   # 2点被约束的自由度
+    one_dof = locator_meta["one_dof"]   # 1点被约束的自由度
+    def _dof_tag(dof_name):
+        if two_dof == dof_name:
+            return "  ← 被2点约束"
+        if one_dof == dof_name:
+            return "  ← 被1点约束"
+        return "  ← 自由分量"
     print("   ✅ Python Support+2-1 重分析完成")
-    print(f"   📘 Python Max |UZ| = {metrics['max_abs_uz_mm']:.6f} mm")
+    print(f"   📘 约束分配: 2点={two_dof}=0  |  1点={one_dof}=0  |  支撑=UZ=0")
+    print(f"   📘 Python Max |UX| = {metrics['max_abs_ux_mm']:.6f} mm{_dof_tag('UX')}")
+    print(f"   📘 Python Max |UY| = {metrics['max_abs_uy_mm']:.6f} mm{_dof_tag('UY')}")
+    print(f"   📘 Python Max |UZ| = {metrics['max_abs_uz_mm']:.6f} mm  ← 被支撑约束")
     print(f"   📘 Python Max |U|  = {metrics['max_usum_mm']:.6f} mm")
     return metrics
 
@@ -1393,7 +1406,7 @@ def solve_ansys_support_plus_21(mapdl, env, support_points, locator2_points, loc
     print("\n🔒 [Step 6] 在 ANSYS 中施加 Support + 2-1 约束并求解 ...")
 
     # ---- A. N 支撑点：patch 模型 ----
-    support_patch_ids_list, support_patch_coords_list, support_patch_sizes = \
+    support_patch_ids_list, _, support_patch_sizes = \
         map_support_patches_to_ansys_nodes(mapdl, support_points, SUPPORT_RADIUS)
 
     if any(sz == 0 for sz in support_patch_sizes):
@@ -1464,6 +1477,8 @@ def solve_ansys_support_plus_21(mapdl, env, support_points, locator2_points, loc
         usum_arr_ansys = np.sqrt(ux_arr_ansys**2 + uy_arr_ansys**2 + uz_arr_ansys**2)
 
         ansys_max_abs_uz_mm = float(np.max(np.abs(uz_arr_ansys)) * 1000.0)
+        ansys_max_abs_ux_mm = float(np.max(np.abs(ux_arr_ansys)) * 1000.0)
+        ansys_max_abs_uy_mm = float(np.max(np.abs(uy_arr_ansys)) * 1000.0)
         ansys_max_usum_mm = float(np.max(np.abs(usum_arr_ansys)) * 1000.0)
     except Exception:
         ux_arr_ansys = None
@@ -1471,6 +1486,8 @@ def solve_ansys_support_plus_21(mapdl, env, support_points, locator2_points, loc
         uz_arr_ansys = None
         usum_arr_ansys = None
         ansys_max_abs_uz_mm = np.nan
+        ansys_max_abs_ux_mm = np.nan
+        ansys_max_abs_uy_mm = np.nan
         ansys_max_usum_mm = np.nan
 
     # --- 结果图 ---
@@ -1502,6 +1519,8 @@ def solve_ansys_support_plus_21(mapdl, env, support_points, locator2_points, loc
         "locator2_ids": locator2_ids,
         "locator1_id": int(locator1_ids[0]),
         "ansys_max_abs_uz_mm": ansys_max_abs_uz_mm,
+        "ansys_max_abs_ux_mm": ansys_max_abs_ux_mm,
+        "ansys_max_abs_uy_mm": ansys_max_abs_uy_mm,
         "ansys_max_usum_mm": ansys_max_usum_mm,
         "support_center_mapping_dists": support_center_dists,
         "locator2_mapping_dists": locator2_dists,
@@ -1525,7 +1544,7 @@ def save_python_mdsm_true_scale_3d(env, py_metrics, support_points, locator2_poi
     range_y = np.ptp(y_raw)
     range_z = np.ptp(z_raw)
 
-    val = np.abs(py_metrics["uz"]) * 1000.0  # mm
+    val = np.abs(py_metrics["uz"]) * 1000.0  # mm，取绝对值
     vmax = np.max(val)
     if vmax < 1e-9:
         vmax = 1e-9
@@ -1540,14 +1559,16 @@ def save_python_mdsm_true_scale_3d(env, py_metrics, support_points, locator2_poi
     Ci = griddata((x_raw, y_raw), val, (Xi, Yi), method="cubic")
     Ci = fill_nan_grid(Ci, Xi, Yi, x_raw, y_raw, val)
 
+    # 映射 [0, vmax] 到 [0, 1] 用于着色
     norm_C = np.clip(Ci / vmax, 0.0, 1.0)
 
     fig = plt.figure(figsize=(10, 7))
     ax = fig.add_subplot(111, projection="3d")
 
+    CMAP = cm.jet   # 蓝(小)→红(大)，与 evaluate.py 保持一致
     ax.plot_surface(
         Xi, Yi, Zi,
-        facecolors=cm.jet(norm_C),
+        facecolors=CMAP(norm_C),
         rstride=2, cstride=2,
         shade=False,
         linewidth=0,
@@ -1571,7 +1592,8 @@ def save_python_mdsm_true_scale_3d(env, py_metrics, support_points, locator2_poi
     draw_vertical_marker(px, py, pz, "magenta", "s", 180)
 
     ax.set_title(
-        f"Python MDSM Predicted UZ ({locator_meta['scheme']})\nMax: {np.max(val):.4e} mm",
+        f"Python MDSM Predicted UZ [{locator_meta['scheme']}]\n"
+        f"Max: {np.max(val):.4e} mm",
         fontsize=15, fontweight="bold"
     )
     ax.set_xlabel("X (m)")
@@ -1583,7 +1605,8 @@ def save_python_mdsm_true_scale_3d(env, py_metrics, support_points, locator2_poi
     ax.yaxis.pane.fill = False
     ax.zaxis.pane.fill = False
 
-    m = cm.ScalarMappable(cmap=cm.jet)
+    # 色条：[0, vmax]，与 evaluate.py 保持一致
+    m = cm.ScalarMappable(cmap=CMAP)
     m.set_array(np.array([0, vmax]))
     cbar = fig.colorbar(m, ax=ax, orientation="horizontal", fraction=0.05, pad=0.08)
     cbar.set_label("Deformation (mm) [Red=Max, Blue=Min]", fontsize=11)
@@ -1699,8 +1722,12 @@ def run_one_scheme(env, mapdl, support_points, scheme_name):
         "scheme": scheme_name,
         "locator_meta": locator_meta,
         "python_max_abs_uz_mm": py_metrics["max_abs_uz_mm"],
+        "python_max_abs_ux_mm": py_metrics["max_abs_ux_mm"],
+        "python_max_abs_uy_mm": py_metrics["max_abs_uy_mm"],
         "python_max_usum_mm": py_metrics["max_usum_mm"],
         "ansys_max_abs_uz_mm": ansys_metrics["ansys_max_abs_uz_mm"],
+        "ansys_max_abs_ux_mm": ansys_metrics["ansys_max_abs_ux_mm"],
+        "ansys_max_abs_uy_mm": ansys_metrics["ansys_max_abs_uy_mm"],
         "ansys_max_usum_mm": ansys_metrics["ansys_max_usum_mm"],
         "support_patch_sizes": ansys_metrics["support_patch_sizes"],
         "files": {
@@ -1749,38 +1776,78 @@ def main():
             result = run_one_scheme(env, mapdl, support_points, scheme_name)
             results.append(result)
 
+        # ──────────────────────────────────────────────────────────────────
+        # 汇总对比表
+        # ──────────────────────────────────────────────────────────────────
         print("\n" + "=" * 72)
         print("📊 两组 2-1 定位方案对比")
         print("=" * 72)
-        print(f"现有环境（全向刚约束） Python Max |UZ| : {full_constraint_python_mm:.6f} mm")
+        print(f"基准（全向刚约束 Python） Max |UZ| : {full_constraint_python_mm:.6f} mm")
+        print("  ↑ 该值仅含 UZ，用于与支撑+2-1 方案的 UZ 结果对比")
         print("-" * 72)
 
         for r in results:
+            meta = r["locator_meta"]
+            two_dof = meta["two_dof"]
+            one_dof = meta["one_dof"]
             print(f"方案: {r['scheme']}")
-            print(f"  2点定位边: {r['locator_meta']['two_edge_primary']} -> DOF={r['locator_meta']['two_dof']}")
-            print(f"  1点定位边: {r['locator_meta']['one_edge_primary']} -> DOF={r['locator_meta']['one_dof']}")
+            print(f"  约束配置: 2点({meta['two_edge_primary']})={two_dof}=0"
+                  f"  |  1点({meta['one_edge_primary']})={one_dof}=0"
+                  f"  |  支撑patch=UZ=0")
             print(f"  支撑 patch 节点数: {r['support_patch_sizes']}")
-            print(f"  Python Max |UZ| : {r['python_max_abs_uz_mm']:.6f} mm")
-            print(f"  Python Max |U|  : {r['python_max_usum_mm']:.6f} mm")
-            print(f"  ANSYS  Max |UZ| : {r['ansys_max_abs_uz_mm']:.6f} mm")
-            print(f"  ANSYS  Max |U|  : {r['ansys_max_usum_mm']:.6f} mm")
+            print()
+            # ── Python 端 ──
+            print(f"  [Python]  Max |UX| = {r['python_max_abs_ux_mm']:.6f} mm"
+                  + ("  (被2点约束↓)" if two_dof == "UX" else
+                     ("  (被1点约束↓)" if one_dof == "UX" else "  (平面内自由)")))
+            print(f"  [Python]  Max |UY| = {r['python_max_abs_uy_mm']:.6f} mm"
+                  + ("  (被2点约束↓)" if two_dof == "UY" else
+                     ("  (被1点约束↓)" if one_dof == "UY" else "  (平面内自由)")))
+            print(f"  [Python]  Max |UZ| = {r['python_max_abs_uz_mm']:.6f} mm  (被支撑约束↓)")
+            print(f"  [Python]  Max |U|  = {r['python_max_usum_mm']:.6f} mm")
+            # ── ANSYS 端 ──
+            print(f"  [ANSYS ]  Max |UX| = {r['ansys_max_abs_ux_mm']:.6f} mm"
+                  + ("  (被2点约束↓)" if two_dof == "UX" else
+                     ("  (被1点约束↓)" if one_dof == "UX" else "  (平面内自由)")))
+            print(f"  [ANSYS ]  Max |UY| = {r['ansys_max_abs_uy_mm']:.6f} mm"
+                  + ("  (被2点约束↓)" if two_dof == "UY" else
+                     ("  (被1点约束↓)" if one_dof == "UY" else "  (平面内自由)")))
+            print(f"  [ANSYS ]  Max |UZ| = {r['ansys_max_abs_uz_mm']:.6f} mm  (被支撑约束↓)")
+            print(f"  [ANSYS ]  Max |U|  = {r['ansys_max_usum_mm']:.6f} mm")
+            print()
             print(f"  输出图像:")
-            print(f"    - {r['files']['layout_png']}")
-            print(f"    - {r['files']['constraint_png']}")
-            print(f"    - {r['files']['result_png']}")
-            print(f"    - {r['files']['python_png']}")
-            print(f"    - {r['files']['compare_png']}")
+            for fval in r["files"].values():
+                print(f"    - {fval}")
             print("-" * 72)
 
         if len(results) == 2:
             r0, r1 = results
-            print("📈 两方案差异（ANSYS）:")
-            print(f"  Δ Max |UZ| = {r1['ansys_max_abs_uz_mm'] - r0['ansys_max_abs_uz_mm']:.6f} mm")
-            print(f"  Δ Max |U|  = {r1['ansys_max_usum_mm'] - r0['ansys_max_usum_mm']:.6f} mm")
+            duz_a  = r1["ansys_max_abs_uz_mm"]  - r0["ansys_max_abs_uz_mm"]
+            dux_a  = r1["ansys_max_abs_ux_mm"]  - r0["ansys_max_abs_ux_mm"]
+            duy_a  = r1["ansys_max_abs_uy_mm"]  - r0["ansys_max_abs_uy_mm"]
+            du_a   = r1["ansys_max_usum_mm"]     - r0["ansys_max_usum_mm"]
+            duz_p  = r1["python_max_abs_uz_mm"] - r0["python_max_abs_uz_mm"]
+            dux_p  = r1["python_max_abs_ux_mm"] - r0["python_max_abs_ux_mm"]
+            duy_p  = r1["python_max_abs_uy_mm"] - r0["python_max_abs_uy_mm"]
+            du_p   = r1["python_max_usum_mm"]   - r0["python_max_usum_mm"]
+
+            print(f"📈 两方案差异  (y2_x1 − x2_y1):")
+            print(f"  {'指标':<22}  {'ANSYS':>12}  {'Python':>12}  说明")
+            print(f"  {'-'*22}  {'-'*12}  {'-'*12}  {'-'*24}")
+            print(f"  {'Δ Max |UX| (mm)':<22}  {dux_a:>+12.6f}  {dux_p:>+12.6f}"
+                  f"  {'← y2_x1 中 UX 被2点压制' if abs(dux_a) > abs(duy_a) else '← x2_y1 中 UX 被1点压制'}")
+            print(f"  {'Δ Max |UY| (mm)':<22}  {duy_a:>+12.6f}  {duy_p:>+12.6f}"
+                  f"  {'← y2_x1 中 UY 被1点压制' if abs(duy_a) < abs(dux_a) else '← x2_y1 中 UY 被2点压制'}")
+            print(f"  {'Δ Max |UZ| (mm)':<22}  {duz_a:>+12.6f}  {duz_p:>+12.6f}"
+                  f"  ← 支撑配置相同，UZ 应几乎不变")
+            print(f"  {'Δ Max |U|  (mm)':<22}  {du_a:>+12.6f}  {du_p:>+12.6f}"
+                  f"  ← U 微变量由平面内自由分量贡献")
             print("-" * 72)
-            print("📈 两方案差异（Python）:")
-            print(f"  Δ Max |UZ| = {r1['python_max_abs_uz_mm'] - r0['python_max_abs_uz_mm']:.6f} mm")
-            print(f"  Δ Max |U|  = {r1['python_max_usum_mm'] - r0['python_max_usum_mm']:.6f} mm")
+            print("💡 物理解释:")
+            print(f"   x2_y1: 2点约束 UY（沿Y方向压紧）→ UY 被抑制，UX 相对自由")
+            print(f"   y2_x1: 2点约束 UX（沿X方向压紧）→ UX 被抑制，UY 相对自由")
+            print(f"   UZ 由支撑点决定（两方案支撑相同）→ Δ|UZ| ≈ 0 符合预期")
+            print(f"   |U| 的微小差异即来源于 UX/UY 自由分量在两方案间的交换")
 
     except Exception as e:
         print(f"\n❌ 验证过程出错: {e}")
