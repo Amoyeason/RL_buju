@@ -70,7 +70,7 @@ def main():
         return
 
     # 1. 初始化环境
-    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N)
+    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N, constraint_mode="n21")
     model = MaskablePPO.load(MODEL_PATH)
 
     # 2. AI 推理
@@ -83,14 +83,24 @@ def main():
         obs, _, done, _, _ = env.step(action)
 
     ai_fixtures = np.array(env.fixtures)
-    ai_uz = env.last_uz
-    ai_max = np.max(np.abs(ai_uz)) * 1000.0  # mm
+    ai_solution = env.last_solution
+    ai_uz = ai_solution["uz"]
+    ai_max = ai_solution["max_abs_uz_mm"]
 
     # 3. 计算智能人工基准
     print(f"👷 生成几何人工基准...")
     manual_fixtures_list = get_smart_manual_baseline(env)
-    man_uz = env._solve_mdsm(manual_fixtures_list)
-    man_max = np.max(np.abs(man_uz)) * 1000.0  # mm
+
+    if env.constraint_mode == "n21":
+        man_solution = env._solve_mdsm(manual_fixtures_list, return_metrics=True)
+        man_uz = man_solution["uz"]
+        man_max = man_solution["max_abs_uz_mm"]
+        env.last_locator_meta = man_solution["locator_meta"]
+        env.last_locator2_points = man_solution["locator2_points"]
+        env.last_locator1_point = man_solution["locator1_point"]
+    else:
+        man_uz = env._solve_mdsm(manual_fixtures_list)
+        man_max = np.max(np.abs(man_uz)) * 1000.0  # mm
 
     # 打印结果
     print(f"\n📊 结果对比:")

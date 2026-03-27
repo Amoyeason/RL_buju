@@ -5,14 +5,25 @@ from scipy import sparse
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import KDTree
 import os
+from constraint_n21 import select_21_locator_points, solve_mdsm_n21
 
 
 class SmartFixtureEnv3D(gym.Env):
-    def __init__(self, data_dir="E:\\ansys_data_final", target_n=8):
+    def __init__(self, data_dir="E:\\ansys_data_final", target_n=8, constraint_mode="n21", locator_scheme="x2_y1", support_radius=0.05, locator_clearance=0.12, boundary_tol=0.032, penalty=1e15):
         super(SmartFixtureEnv3D, self).__init__()
 
+        self.constraint_mode = constraint_mode
+        self.locator_scheme = locator_scheme
+        self.support_radius = support_radius
+        self.locator_clearance = locator_clearance
+        self.boundary_tol = boundary_tol
+        self.penalty = penalty
+
         # ================= 1. 加载 3D 物理数据 =================
-        print("🤖 初始化 3D 物理引擎 (Full-Constraint Rigid Mode)...")
+        if self.constraint_mode == "n21":
+            print(f"🤖 初始化 3D 物理引擎 (N-2-1 Constraint Mode, scheme={self.locator_scheme})...")
+        else:
+            print("🤖 初始化 3D 物理引擎 (Full-Constraint Rigid Mode)...")
         try:
             # 加载刚度矩阵 K
             K_raw = sparse.load_npz(os.path.join(data_dir, "K_pure.npz"))
@@ -120,8 +131,19 @@ class SmartFixtureEnv3D(gym.Env):
             self.fixtures.append(tuple(self.candidates[idx]))
             self.occupied_indices.add(idx)
 
-        self.last_uz = self._solve_mdsm(self.fixtures)
-        self.last_max_def = np.max(np.abs(self.last_uz)) * 1000.0
+        # 统一使用带有 return_metrics=True 的调用，收集包含所有全量数据的字典
+        self.last_solution = self._solve_mdsm(self.fixtures, return_metrics=True)
+        self.last_uz = self.last_solution["uz"]
+
+        # 为了兼容现有训练机制，仍然把最大 Z 向变形作为 self.last_max_def
+        self.last_max_def = self.last_solution["max_abs_uz_mm"]
+
+        # 保存这步的定位点元数据，方便渲染或后续分析
+        if self.constraint_mode == "n21":
+            self.last_locator_meta = self.last_solution.get("locator_meta")
+            self.last_locator2_points = self.last_solution.get("locator2_points")
+            self.last_locator1_point = self.last_solution.get("locator1_point")
+
         return self._get_obs(self.last_uz), {}
 
     def _find_max_area_triangle(self):
@@ -233,8 +255,14 @@ class SmartFixtureEnv3D(gym.Env):
         self.fixtures.append(tuple(self.candidates[idx]))
         self.occupied_indices.add(idx)
 
-        uz_current = self._solve_mdsm(self.fixtures)
-        current_max_def = np.max(np.abs(uz_current)) * 1000.0  # mm
+        self.last_solution = self._solve_mdsm(self.fixtures, return_metrics=True)
+        uz_current = self.last_solution["uz"]
+        current_max_def = self.last_solution["max_abs_uz_mm"]  # mm
+
+        if self.constraint_mode == "n21":
+            self.last_locator_meta = self.last_solution.get("locator_meta")
+            self.last_locator2_points = self.last_solution.get("locator2_points")
+            self.last_locator1_point = self.last_solution.get("locator1_point")
 
         # ================= 🟢 V48 百分比强力驱动版 =================
         step_reward = 0.0
@@ -302,26 +330,65 @@ class SmartFixtureEnv3D(gym.Env):
 
         return np.concatenate([uz_scaled, occupancy]).astype(np.float32)
 
-    def _solve_mdsm(self, active_fixtures):
-        K_mod = self.K_base.copy()
-        F_mod = self.F_base.copy()
-        penalty = 1e15
+    def _solve_mdsm(self, active_fixtures, return_metrics=False):
+        if self.constraint_mode == "n21":
+            if not active_fixtures:
+                # 没有任何支撑点时的兜底
+                metrics = {
+                    "uz": np.zeros(self.n_nodes),
+                    "max_abs_uz_mm": 0.0,
+                    "locator_meta": None,
+                    "locator2_points": None,
+                    "locator1_point": None
+                }
+                return metrics if return_metrics else metrics["uz"]
 
-        if active_fixtures:
-            indices_list = self.fem_tree_3d.query_ball_point(active_fixtures, self.fixture_radius)
-            for indices in indices_list:
-                for idx in indices:
-                    for eq_map in [self.uz_map, self.ux_map, self.uy_map]:
-                        eq = eq_map[idx]
-                        if eq != -1:
-                            K_mod[eq, eq] += penalty
-                            F_mod[eq] = 0.0
-        try:
-            U_vec = spsolve(K_mod, F_mod)
-        except:
-            return np.zeros(self.n_nodes)
+            pts2, pts1, meta = select_21_locator_points(
+                env=self,
+                support_points=active_fixtures,
+                scheme=self.locator_scheme,
+                clearance=self.locator_clearance,
+                boundary_tol=self.boundary_tol
+            )
+            metrics = solve_mdsm_n21(
+                env=self,
+                support_points=active_fixtures,
+                locator2_points=pts2,
+                locator1_point=pts1,
+                locator_meta=meta,
+                penalty=self.penalty,
+                support_radius=self.support_radius,
+                locator_clearance=self.locator_clearance
+            )
+            return metrics if return_metrics else metrics["uz"]
+        else:
+            # 兼容旧版的 "full" 刚性约束
+            K_mod = self.K_base.copy()
+            F_mod = self.F_base.copy()
+            penalty = 1e15
 
-        uz_result = np.zeros(self.n_nodes)
-        valid_mask = self.uz_map != -1
-        uz_result[valid_mask] = U_vec[self.uz_map[valid_mask]]
-        return uz_result
+            if active_fixtures:
+                indices_list = self.fem_tree_3d.query_ball_point(active_fixtures, self.fixture_radius)
+                for indices in indices_list:
+                    for idx in indices:
+                        for eq_map in [self.uz_map, self.ux_map, self.uy_map]:
+                            eq = eq_map[idx]
+                            if eq != -1:
+                                K_mod[eq, eq] += penalty
+                                F_mod[eq] = 0.0
+            try:
+                U_vec = spsolve(K_mod, F_mod)
+            except:
+                U_vec = np.zeros(self.n_nodes)
+
+            uz_result = np.zeros(self.n_nodes)
+            valid_mask = self.uz_map != -1
+            uz_result[valid_mask] = U_vec[self.uz_map[valid_mask]]
+
+            if return_metrics:
+                # 为了格式统一，造一个 metrics 字典
+                return {
+                    "uz": uz_result,
+                    "max_abs_uz_mm": float(np.max(np.abs(uz_result)) * 1000.0)
+                }
+            return uz_result

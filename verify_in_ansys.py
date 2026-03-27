@@ -11,6 +11,7 @@ from ansys.mapdl.core import launch_mapdl
 from sb3_contrib import MaskablePPO
 from smart_fixture_env import SmartFixtureEnv3D
 from scipy.spatial import KDTree
+from constraint_n21 import map_support_patches_to_ansys_nodes, map_locator_to_ansys_node
 
 # ================= 配置区域 =================
 DATA_DIR = "E:\\ansys_data_final"
@@ -55,7 +56,7 @@ def main():
 
     # 1. AI 规划
     print("\n🤖 [Step 1] AI 正在推理布局...")
-    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N)
+    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N, constraint_mode="n21")
     model = MaskablePPO.load(MODEL_PATH)
 
     obs, _ = env.reset()
@@ -124,20 +125,44 @@ def main():
 
         # --- B. 映射 ---
         print("   🔍 映射 AI 布局点...")
-        current_nodes = mapdl.mesh.nodes
-        current_nnum = mapdl.mesh.nnum
-        tree = KDTree(current_nodes)
-        target_ids = []
-        for coord in ai_coords:
-            dist, idx = tree.query(coord)
-            target_ids.append(current_nnum[idx])
-
-        print(f"   🔒 施加约束 ({len(target_ids)} 点)...")
         mapdl.run("/SOLU");
         mapdl.antype("STATIC");
         mapdl.acel(0, 0, 9.8)
         mapdl.ddele("ALL", "ALL")
-        for nid in target_ids: mapdl.d(nid, "ALL", 0)
+
+        if env.constraint_mode == "n21":
+            print(f"   🔒 施加 N-2-1 物理约束 ({env.locator_scheme})...")
+            # 1. 施加 N 点面域支撑 (UZ=0)
+            patch_ids_list, _, sizes = map_support_patches_to_ansys_nodes(mapdl, ai_coords, env.support_radius)
+            total_sup_nodes = sum(sizes)
+            for ids in patch_ids_list:
+                for nid in ids:
+                    mapdl.d(nid, "UZ", 0)
+
+            # 2. 施加 2点定位
+            if hasattr(env, "last_locator2_points") and env.last_locator2_points is not None:
+                two_dof = env.last_locator_meta["two_dof"]
+                for p2 in env.last_locator2_points:
+                    nid2, _ = map_locator_to_ansys_node(mapdl, p2, env.locator_clearance)
+                    if nid2 is not None:
+                        mapdl.d(nid2, two_dof, 0)
+
+            # 3. 施加 1点定位
+            if hasattr(env, "last_locator1_point") and env.last_locator1_point is not None:
+                one_dof = env.last_locator_meta["one_dof"]
+                nid1, _ = map_locator_to_ansys_node(mapdl, env.last_locator1_point, env.locator_clearance)
+                if nid1 is not None:
+                    mapdl.d(nid1, one_dof, 0)
+        else:
+            print("   🔒 施加完全刚性约束...")
+            current_nodes = mapdl.mesh.nodes
+            current_nnum = mapdl.mesh.nnum
+            tree = KDTree(current_nodes)
+            target_ids = []
+            for coord in ai_coords:
+                dist, idx = tree.query(coord)
+                target_ids.append(current_nnum[idx])
+            for nid in target_ids: mapdl.d(nid, "ALL", 0)
 
         # 🟢 [关键复刻] 绘制并保存第一张图：约束位置图 (ISO视角)
         # 这就是您提到的“少输出的一张图”
@@ -167,10 +192,10 @@ def main():
         mapdl.post1();
         mapdl.set("LAST")
         try:
-            disp_array = mapdl.post_processing.nodal_displacement("SUM")
-            ansys_max_mm = np.max(disp_array) * 1000.0
+            disp_array = mapdl.post_processing.nodal_displacement("Z")
+            ansys_max_mm = np.max(np.abs(disp_array)) * 1000.0
         except:
-            mapdl.nsort("U", "SUM")
+            mapdl.nsort("U", "Z")
             ansys_max_mm = mapdl.get_value("SORT", 0, "MAX") * 1000.0
 
         print("\n" + "=" * 40)

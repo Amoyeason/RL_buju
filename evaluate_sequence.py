@@ -21,7 +21,7 @@ def main():
         return
 
     # 1. 初始化
-    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N)
+    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N, constraint_mode="n21")
     model = MaskablePPO.load(MODEL_PATH)
 
     # 2. 收集每一步的数据
@@ -32,7 +32,7 @@ def main():
 
     # 记录 Step 0 (初始 N-2-1)
     # 注意：env.fixtures 此时已经有3个点
-    uz_init = env.last_uz
+    uz_init = env.last_solution["uz"]
     history.append({
         "step": len(env.fixtures),
         "uz": uz_init,
@@ -49,11 +49,11 @@ def main():
         # 记录当前步
         history.append({
             "step": len(env.fixtures),
-            "uz": env.last_uz,
+            "uz": env.last_solution["uz"],
             "fixtures": list(env.fixtures),
             "new_idx": len(env.fixtures) - 1  # 列表最后一个是新加的
         })
-        print(f"   -> Step {history[-1]['step']}: Max Def = {np.max(np.abs(env.last_uz)) * 1000:.4f} mm")
+        print(f"   -> Step {history[-1]['step']}: Max Def = {env.last_solution['max_abs_uz_mm']:.4f} mm")
 
     # ================= 3. 绘图 (核心渲染逻辑) =================
     print("\n🎨 正在渲染序列图...")

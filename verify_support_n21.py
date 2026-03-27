@@ -19,6 +19,8 @@
 # from scipy.interpolate import griddata
 
 # from ansys.mapdl.core import launch_mapdl
+from constraint_n21 import select_21_locator_points
+from constraint_n21 import solve_mdsm_n21
 # from sb3_contrib import MaskablePPO
 # from smart_fixture_env import SmartFixtureEnv3D
 
@@ -986,7 +988,7 @@ def infer_ai_support_layout():
         raise FileNotFoundError(f"找不到模型文件: {MODEL_PATH}.zip")
 
     print("🤖 [Step 1] AI 正在推理 8 个 N 类支撑点 ...")
-    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N)
+    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N, constraint_mode="n21")
     model = MaskablePPO.load(MODEL_PATH)
 
     obs, _ = env.reset()
@@ -1013,7 +1015,7 @@ def infer_ai_support_layout():
 #   - x2_y1: X方向作为2，Y方向作为1
 #   - y2_x1: Y方向作为2，X方向作为1
 # ==============================
-def select_21_locator_points(env, support_points, scheme="x2_y1"):
+def select_21_locator_points_old(env, support_points, scheme="x2_y1"):
     print(f"\n📐 [Step 2] 自动构造独立的 2-1 定位点 (scheme={scheme}) ...")
 
     nodes = np.asarray(env.nodes, dtype=float)
@@ -1148,81 +1150,17 @@ def select_21_locator_points(env, support_points, scheme="x2_y1"):
 def solve_python_support_plus_21(env, support_points, locator2_points, locator1_point, locator_meta, penalty=PENALTY):
     print("\n🧮 [Step 3] Python 端进行 Support + 2-1 独立重分析 ...")
 
-    ndof = env.K_base.shape[0]
-    penalty_vec = np.zeros(ndof, dtype=np.float64)
-
-    # A. N 类支撑点：UZ patch
-    support_indices_list = env.fem_tree_3d.query_ball_point(np.asarray(support_points), SUPPORT_RADIUS)
-    support_node_ids = set()
-    for idx_list in support_indices_list:
-        for node_idx in idx_list:
-            support_node_ids.add(int(node_idx))
-            eq = int(env.uz_map[node_idx])
-            if eq >= 0:
-                penalty_vec[eq] = penalty
-
-    # B. 2 点定位
-    locator2_node_ids = []
-    for pt in np.asarray(locator2_points):
-        _, node_idx = env.fem_tree_3d.query(pt)
-        locator2_node_ids.append(int(node_idx))
-
-        if locator_meta["two_dof"] == "UX":
-            eq = int(env.ux_map[node_idx])
-        elif locator_meta["two_dof"] == "UY":
-            eq = int(env.uy_map[node_idx])
-        else:
-            raise ValueError(f"未知 two_dof: {locator_meta['two_dof']}")
-
-        if eq >= 0:
-            penalty_vec[eq] = penalty
-
-    # C. 1 点定位
-    _, locator1_node_idx = env.fem_tree_3d.query(np.asarray(locator1_point))
-    locator1_node_idx = int(locator1_node_idx)
-
-    if locator_meta["one_dof"] == "UX":
-        eq = int(env.ux_map[locator1_node_idx])
-    elif locator_meta["one_dof"] == "UY":
-        eq = int(env.uy_map[locator1_node_idx])
-    else:
-        raise ValueError(f"未知 one_dof: {locator_meta['one_dof']}")
-
-    if eq >= 0:
-        penalty_vec[eq] = penalty
-
-    K_mod = env.K_base + sparse.diags(penalty_vec, format="csr")
-    F_mod = env.F_base.copy()
-
-    U_vec = spsolve(K_mod, F_mod)
-
-    ux = np.zeros(env.n_nodes, dtype=np.float64)
-    uy = np.zeros(env.n_nodes, dtype=np.float64)
-    uz = np.zeros(env.n_nodes, dtype=np.float64)
-
-    valid_ux = env.ux_map >= 0
-    valid_uy = env.uy_map >= 0
-    valid_uz = env.uz_map >= 0
-
-    ux[valid_ux] = U_vec[env.ux_map[valid_ux]]
-    uy[valid_uy] = U_vec[env.uy_map[valid_uy]]
-    uz[valid_uz] = U_vec[env.uz_map[valid_uz]]
-
-    usum = np.sqrt(ux**2 + uy**2 + uz**2)
-
-    metrics = {
-        "ux": ux,
-        "uy": uy,
-        "uz": uz,
-        "usum": usum,
-        "max_abs_ux_mm": float(np.max(np.abs(ux)) * 1000.0),
-        "max_abs_uy_mm": float(np.max(np.abs(uy)) * 1000.0),
-        "max_abs_uz_mm": float(np.max(np.abs(uz)) * 1000.0),
-        "max_usum_mm": float(np.max(usum) * 1000.0),
-        "support_patch_node_count": len(support_node_ids),
-        "locator2_node_ids_python": locator2_node_ids,
-        "locator1_node_id_python": locator1_node_idx,
-    }
+    # 使用刚提取的通用物理约束求解器
+    metrics = solve_mdsm_n21(
+        env=env,
+        support_points=support_points,
+        locator2_points=locator2_points,
+        locator1_point=locator1_point,
+        locator_meta=locator_meta,
+        penalty=penalty,
+        support_radius=SUPPORT_RADIUS,
+        locator_clearance=LOCATOR_CLEARANCE
+    )
 
     two_dof = locator_meta["two_dof"]   # 2点被约束的自由度
     one_dof = locator_meta["one_dof"]   # 1点被约束的自由度
@@ -1415,10 +1353,26 @@ def solve_ansys_support_plus_21(mapdl, env, support_points, locator2_points, loc
     support_center_ids, support_center_dists = map_points_to_ansys_nodes(mapdl, support_points)
 
     # ---- B. 2-1 定位点：单节点 ----
-    locator2_ids, locator2_dists = map_points_to_ansys_nodes(mapdl, locator2_points)
-    locator1_ids, locator1_dists = map_points_to_ansys_nodes(
-        mapdl, np.asarray(locator1_point).reshape(1, 3)
-    )
+    from constraint_n21 import map_locator_to_ansys_node
+
+    locator2_ids = []
+    locator2_dists = []
+    for pt in locator2_points:
+        nid, mapped_coords = map_locator_to_ansys_node(mapdl, pt, LOCATOR_CLEARANCE)
+        if nid is not None:
+            locator2_ids.append(nid)
+            locator2_dists.append(np.linalg.norm(np.asarray(pt)[:2] - mapped_coords[:2]))
+        else:
+            raise RuntimeError("无法为 2 点定位映射到 ANSYS 节点")
+
+    locator1_ids = []
+    locator1_dists = []
+    nid1, mapped_coords1 = map_locator_to_ansys_node(mapdl, locator1_point, LOCATOR_CLEARANCE)
+    if nid1 is not None:
+        locator1_ids.append(nid1)
+        locator1_dists.append(np.linalg.norm(np.asarray(locator1_point)[:2] - mapped_coords1[:2]))
+    else:
+        raise RuntimeError("无法为 1 点定位映射到 ANSYS 节点")
 
     print(f"   支撑中心点映射平均距离: {np.mean(support_center_dists):.6e} m")
     print(f"   支撑 patch 节点数: {support_patch_sizes}")
@@ -1664,7 +1618,7 @@ def run_one_scheme(env, mapdl, support_points, scheme_name):
     compare_png = scheme_file("verify_support21_mdsm_vs_ansys", scheme_name)
 
     locator2_points, locator1_point, locator_meta = select_21_locator_points(
-        env, support_points, scheme=scheme_name
+        env, support_points, scheme=scheme_name, clearance=LOCATOR_CLEARANCE, boundary_tol=BOUNDARY_TOL
     )
 
     format_points(f"{scheme_name} - 2 点定位器", locator2_points)

@@ -18,7 +18,7 @@ def main():
     print(f"🚀 启动多轮一致性测试 (共 {TEST_ROUNDS} 轮)...")
     if not os.path.exists(MODEL_PATH + ".zip"): return
 
-    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N)
+    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N, constraint_mode="n21")
     model = MaskablePPO.load(MODEL_PATH)
 
     results = []
@@ -35,10 +35,10 @@ def main():
             action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
             obs, _, done, _, _ = env.step(action)
 
-        uz = env.last_uz
+        uz = env.last_solution["uz"]
         results.append({
             "round": r + 1,
-            "max": np.max(np.abs(uz)) * 1000.0,
+            "max": env.last_solution["max_abs_uz_mm"],
             "uz": uz,
             "fixtures": np.array(env.fixtures)
         })

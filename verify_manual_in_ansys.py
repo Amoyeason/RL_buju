@@ -10,6 +10,7 @@ import threading
 from ansys.mapdl.core import launch_mapdl
 from smart_fixture_env import SmartFixtureEnv3D
 from scipy.spatial import KDTree
+from constraint_n21 import map_support_patches_to_ansys_nodes, map_locator_to_ansys_node
 
 # ================= 配置区域 =================
 DATA_DIR = "E:\\ansys_data_final"
@@ -87,15 +88,22 @@ def main():
 
     # 1. 初始化 Python 环境并计算预测值
     print("\n🤖 [Step 1] Python 环境计算...")
-    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N)
+    env = SmartFixtureEnv3D(data_dir=DATA_DIR, target_n=TARGET_N, constraint_mode="n21")
 
     # 获取人工基准点
     manual_fixtures = get_smart_manual_baseline(env)
     print(f"   📍 已生成 {len(manual_fixtures)} 个人工基准点")
 
     # Python 求解
-    uz_py = env._solve_mdsm(manual_fixtures)
-    py_max_def = np.max(np.abs(uz_py)) * 1000.0
+    if env.constraint_mode == "n21":
+        py_solution = env._solve_mdsm(manual_fixtures, return_metrics=True)
+        py_max_def = py_solution["max_abs_uz_mm"]
+        env.last_locator_meta = py_solution["locator_meta"]
+        env.last_locator2_points = py_solution["locator2_points"]
+        env.last_locator1_point = py_solution["locator1_point"]
+    else:
+        uz_py = env._solve_mdsm(manual_fixtures)
+        py_max_def = np.max(np.abs(uz_py)) * 1000.0
     print(f"   📘 Python 预测变形: {py_max_def:.6f} mm")
 
     # 2. 启动 ANSYS 进行真实物理验证
@@ -156,23 +164,45 @@ def main():
         # --- B. 映射施加约束 (直接映射，无旋转) ---
         print("   🔍 映射人工基准点...")
         # 直接使用 ANSYS 原始节点 (因为 extract_data 存的就是原始坐标)
-        current_nodes = mapdl.mesh.nodes
-        current_nnum = mapdl.mesh.nnum
-
-        tree = KDTree(current_nodes)
-        target_ids = []
-
-        # 将 Python 里的夹具坐标映射到 ANSYS 当前网格的最近节点
-        for coord in manual_fixtures:
-            dist, idx = tree.query(coord)
-            target_ids.append(current_nnum[idx])
-
-        print(f"   🔒 施加约束 ({len(target_ids)} 点)...")
+        print(f"   🔒 施加约束 ({len(manual_fixtures)} 点)...")
         mapdl.run("/SOLU");
         mapdl.antype("STATIC");
         mapdl.acel(0, 0, 9.8)
         mapdl.ddele("ALL", "ALL")
-        for nid in target_ids: mapdl.d(nid, "ALL", 0)
+
+        if env.constraint_mode == "n21":
+            print(f"   🔒 施加 N-2-1 物理约束 ({env.locator_scheme})...")
+            # 1. 施加 N 点面域支撑 (UZ=0)
+            patch_ids_list, _, sizes = map_support_patches_to_ansys_nodes(mapdl, manual_fixtures, env.support_radius)
+            total_sup_nodes = sum(sizes)
+            for ids in patch_ids_list:
+                for nid in ids:
+                    mapdl.d(nid, "UZ", 0)
+
+            # 2. 施加 2点定位
+            if hasattr(env, "last_locator2_points") and env.last_locator2_points is not None:
+                two_dof = env.last_locator_meta["two_dof"]
+                for p2 in env.last_locator2_points:
+                    nid2, _ = map_locator_to_ansys_node(mapdl, p2, env.locator_clearance)
+                    if nid2 is not None:
+                        mapdl.d(nid2, two_dof, 0)
+
+            # 3. 施加 1点定位
+            if hasattr(env, "last_locator1_point") and env.last_locator1_point is not None:
+                one_dof = env.last_locator_meta["one_dof"]
+                nid1, _ = map_locator_to_ansys_node(mapdl, env.last_locator1_point, env.locator_clearance)
+                if nid1 is not None:
+                    mapdl.d(nid1, one_dof, 0)
+        else:
+            print("   🔒 施加完全刚性约束...")
+            current_nodes = mapdl.mesh.nodes
+            current_nnum = mapdl.mesh.nnum
+            tree = KDTree(current_nodes)
+            target_ids = []
+            for coord in manual_fixtures:
+                dist, idx = tree.query(coord)
+                target_ids.append(current_nnum[idx])
+            for nid in target_ids: mapdl.d(nid, "ALL", 0)
 
         # 保存约束图以便检查位置是否正确
         mapdl.run("/SHOW, PNG");
@@ -199,10 +229,10 @@ def main():
 
         # 获取最大变形
         try:
-            disp_array = mapdl.post_processing.nodal_displacement("SUM")
-            ansys_max_mm = np.max(disp_array) * 1000.0
+            disp_array = mapdl.post_processing.nodal_displacement("Z")
+            ansys_max_mm = np.max(np.abs(disp_array)) * 1000.0
         except:
-            mapdl.nsort("U", "SUM")
+            mapdl.nsort("U", "Z")
             ansys_max_mm = mapdl.get_value("SORT", 0, "MAX") * 1000.0
 
         print("\n" + "=" * 40)

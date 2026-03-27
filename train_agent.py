@@ -76,7 +76,7 @@ def main():
     print("🚀 启动 3D 曲面训练任务 (Physics V43 Ready)...")
 
     # 1. 创建环境
-    env = SmartFixtureEnv3D(data_dir="E:\\ansys_data_final", target_n=8)
+    env = SmartFixtureEnv3D(data_dir="E:\\ansys_data_final", target_n=8, constraint_mode="n21")
 
     print(f"🧐 动作空间检查: 共有 {env.n_candidates} 个有效候选点")
     if env.n_candidates < env.target_n:
