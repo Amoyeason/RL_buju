@@ -69,17 +69,39 @@ class SmartFixtureEnv3D(gym.Env):
 
         self.action_space = spaces.Discrete(self.n_candidates)
 
-        # 🟢 [优化] 观测空间范围虽然是inf，但我们会输入 scaling 后的值
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(self.n_nodes + self.n_candidates,),
-            dtype=np.float32
-        )
-
         self.target_n = target_n
+        self.max_episode_steps = target_n + 2  # 防止无限步卡死
+        self.step_count = 0
         self.fixtures = []
         self.occupied_indices = set()
         self.last_max_def = 0.0
+        self.last_solution = None
+        self.last_uz = None
+        self.last_locator_meta = None
+        self.last_locator2_points = None
+        self.last_locator1_point = None
+
+        # 扩展观测空间：uz(n_nodes) + occupancy(n_cands) + locator2_xy(4) + locator1_xy(2) + hotspot_xy(2) + max_def(1) + step_ratio(1)
+        _extra_dim = 4 + 2 + 2 + 1 + 1  # = 10
+        _low  = np.concatenate([
+            np.full(self.n_nodes,      -1.0, dtype=np.float32),   # uz after tanh ∈ (-1, 1)
+            np.zeros(self.n_candidates,       dtype=np.float32),  # occupancy ∈ {0,1}
+            np.zeros(_extra_dim,              dtype=np.float32),  # 辅助信息全部归一化到 [0,1]
+        ])
+        _high = np.concatenate([
+            np.full(self.n_nodes,        1.0, dtype=np.float32),
+            np.ones(self.n_candidates,        dtype=np.float32),
+            np.ones(_extra_dim,               dtype=np.float32),
+        ])
+        self.observation_space = spaces.Box(low=_low, high=_high, dtype=np.float32)
+
+        # 缓存几何归一化常量（热路径优化，避免每次 _get_obs 重复计算）
+        self.x_min = float(self.nodes[:, 0].min())
+        self.x_max = float(self.nodes[:, 0].max())
+        self.y_min = float(self.nodes[:, 1].min())
+        self.y_max = float(self.nodes[:, 1].max())
+        self.x_span = max(self.x_max - self.x_min, 1e-6)
+        self.y_span = max(self.y_max - self.y_min, 1e-6)
 
     def _check_candidate_safety(self, center):
         indices = self.fem_tree_3d.query_ball_point(center, self.safety_check_radius)
@@ -125,20 +147,23 @@ class SmartFixtureEnv3D(gym.Env):
         super().reset(seed=seed)
         self.fixtures = []
         self.occupied_indices = set()
+        self.step_count = 0
 
         init_indices = self._find_max_area_triangle()
         for idx in init_indices:
             self.fixtures.append(tuple(self.candidates[idx]))
             self.occupied_indices.add(idx)
 
-        # 统一使用带有 return_metrics=True 的调用，收集包含所有全量数据的字典
-        self.last_solution = self._solve_mdsm(self.fixtures, return_metrics=True)
-        self.last_uz = self.last_solution["uz"]
+        try:
+            self.last_solution = self._solve_mdsm(self.fixtures, return_metrics=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"[Env.reset] 初始三角布局求解失败，请检查物理数据或候选点: {e}"
+            ) from e
 
-        # 为了兼容现有训练机制，仍然把最大 Z 向变形作为 self.last_max_def
+        self.last_uz = self.last_solution["uz"]
         self.last_max_def = self.last_solution["max_abs_uz_mm"]
 
-        # 保存这步的定位点元数据，方便渲染或后续分析
         if self.constraint_mode == "n21":
             self.last_locator_meta = self.last_solution.get("locator_meta")
             self.last_locator2_points = self.last_solution.get("locator2_points")
@@ -225,95 +250,114 @@ class SmartFixtureEnv3D(gym.Env):
 
     def step(self, action):
         idx = int(action)
+        self.step_count += 1
 
-        # 1. 基础惩罚
         if idx in self.occupied_indices:
-            return self._get_obs(self.last_uz), -10.0, False, False, {"max_def_mm": self.last_max_def}
+            truncated = self.step_count >= self.max_episode_steps
+            return self._get_obs(self.last_uz), -10.0, False, truncated, {"max_def_mm": self.last_max_def}
 
-        # 记录当前决策的位置坐标
         current_action_pos = self.candidates[idx]
 
-        # -----------------------------------------------------------
-        # 🔥 新增：在物理计算前，先判断 AI 是否“瞄准”了最大变形区域
-        # -----------------------------------------------------------
-        # 找到上一帧中，变形最大的那个物理节点的坐标
-        max_node_idx = np.argmax(np.abs(self.last_uz))  # 找最大变形点的索引
-        max_node_pos = self.nodes[max_node_idx]  # 获取该点的 (x,y,z)
-
-        # 计算 AI 下子位置与最大变形点的 2D 平面距离
+        # Sniper Bonus：判断是否瞄准热点
+        max_node_idx = np.argmax(np.abs(self.last_uz))
+        max_node_pos = self.nodes[max_node_idx]
         dist_to_hotspot = np.linalg.norm(current_action_pos[:2] - max_node_pos[:2])
 
-        # 🎯 热点引导奖励 (Sniper Bonus)
-        # 距离越近分越高。如果在 0.2m (20cm) 范围内，给高分
-        sniper_reward = 0.0
-        if dist_to_hotspot < 0.2:
-            sniper_reward = 5.0 * (1.0 - dist_to_hotspot / 0.2)  # 最高 5 分
-
-        # -----------------------------------------------------------
-        # 执行物理仿真
-        # -----------------------------------------------------------
+        # 执行物理仿真（含异常保护 + rollback）
         self.fixtures.append(tuple(self.candidates[idx]))
         self.occupied_indices.add(idx)
 
-        self.last_solution = self._solve_mdsm(self.fixtures, return_metrics=True)
+        solve_failed = False
+        try:
+            self.last_solution = self._solve_mdsm(self.fixtures, return_metrics=True)
+        except RuntimeError as e:
+            print(f"[Env] 物理求解失败，执行 rollback: {e}")
+            self.fixtures.pop()
+            self.occupied_indices.discard(idx)
+            solve_failed = True
+
+        if solve_failed:
+            return (
+                self._get_obs(self.last_uz),
+                -10.0,
+                False,
+                True,
+                {"max_def_mm": self.last_max_def, "solve_failed": True},
+            )
+
         uz_current = self.last_solution["uz"]
-        current_max_def = self.last_solution["max_abs_uz_mm"]  # mm
+        current_max_def = self.last_solution["max_abs_uz_mm"]
 
         if self.constraint_mode == "n21":
             self.last_locator_meta = self.last_solution.get("locator_meta")
             self.last_locator2_points = self.last_solution.get("locator2_points")
             self.last_locator1_point = self.last_solution.get("locator1_point")
 
-        # ================= 🟢 V48 百分比强力驱动版 =================
-        step_reward = 0.0
-
-        # 加入瞄准奖励
-        step_reward += sniper_reward
-
-        diff = self.last_max_def - current_max_def
-
-        # 🟢 核心改变：使用“相对提升率”而不是“绝对差值”
-        # 只要你能让当前最大变形下降 10%，无论基数是 2mm 还是 0.2mm，奖励都一样！
-        # 这彻底解决了后期“没动力”的问题
-
-        improvement_ratio = 0.0
-        if self.last_max_def > 1e-5:
-            improvement_ratio = diff / self.last_max_def
-
-        if abs(diff) > 0.002:  # Deadband 保持，防止噪声
-            if diff > 0:
-                # 进步奖励
-                # 例：下降 10% (0.1) -> 奖励 10 分
-                # 例：下降 1% (0.01) -> 奖励 1 分
-                # 这种尺度非常适合 PPO，且 Step 8 和 Step 4 权重一致
-                step_reward += improvement_ratio * 100.0
-
-                # 额外叠加线性项，保证大尺度下降依然爽
-                step_reward += diff * 50.0
-            else:
-                # 退步惩罚 (保持较轻，鼓励试错)
-                step_reward += improvement_ratio * 50.0  # 注意 ratio 是负的
-
-        # 进步微奖 (削弱，防止刷分)
-        if current_max_def < self.last_max_def:
-            step_reward += 0.5
-
+        terminated = len(self.fixtures) >= self.target_n
+        step_reward, reward_info = self._compute_reward(
+            prev_max_def=self.last_max_def,
+            current_max_def=current_max_def,
+            dist_to_hotspot=dist_to_hotspot,
+            terminated=terminated,
+        )
         self.last_uz = uz_current
         self.last_max_def = current_max_def
-        terminated = len(self.fixtures) >= self.target_n
 
-        # D. 终局奖励
+        truncated = (not terminated) and (self.step_count >= self.max_episode_steps)
+        step_reward = np.clip(step_reward, -10.0, 20.0)
+
+        info = {
+            "max_def_mm": float(current_max_def),
+            "dist_to_hotspot": float(dist_to_hotspot),
+            "step_count": int(self.step_count),
+            "n_fixtures": int(len(self.fixtures)),
+            "solve_failed": False,
+        }
+        info.update(reward_info)
+        return self._get_obs(uz_current), step_reward, terminated, truncated, info
+
+    def _compute_reward(self, prev_max_def, current_max_def, dist_to_hotspot=0.0, terminated=False):
+        """三段式奖励函数（V50 对数改善版）。
+
+        返回:
+            total_reward (float): 本步总奖励（clip 前）
+            info (dict): 各分项，供 step() 透传到 info 字典供调试
+        """
+        alpha = 8.0  # 对数改善项系数
+
+        # ── A. 主 dense reward：对数改善 ──────────────────────────────
+        # log((d_{t-1} + eps) / (d_t + eps)) > 0 表示改善，< 0 表示退步
+        # 对数形式：量纲小、不饱和、前后期权重自然均衡
+        eps = 0.1  # mm，防止 log(0)
+        reward_dense = alpha * np.log(
+            (prev_max_def + eps) / (current_max_def + eps)
+        )
+
+        # ── B. 热点引导项 ─────────────────────────────────────────────
+        # 与 dense reward 同量级（最高 ~2.5 分）
+        reward_hotspot = 0.0
+        if dist_to_hotspot < 0.25:
+            reward_hotspot = 2.5 * (1.0 - dist_to_hotspot / 0.25)
+
+        # ── C. 终局奖励（显著降权，避免喧宾夺主）────────────────────
+        reward_terminal = 0.0
         if terminated:
-            # 保持 V47 的温和设计，不喧宾夺主
-            final_score = 25.0 / max(current_max_def, 0.4)
-            step_reward += final_score
+            reward_terminal += 8.0 / max(current_max_def, 0.8)
+            if current_max_def < 1.0:
+                reward_terminal += 2.0
+            if current_max_def < 0.8:
+                reward_terminal += 3.0
+            if current_max_def < 0.6:
+                reward_terminal += 4.0
 
-            if current_max_def < 0.8: step_reward += 10.0
-            if current_max_def < 0.6: step_reward += 20.0
+        total = reward_dense + reward_hotspot + reward_terminal
+        info = {
+            "reward_dense": float(reward_dense),
+            "reward_hotspot": float(reward_hotspot),
+            "reward_terminal": float(reward_terminal),
+        }
+        return total, info
 
-        step_reward = np.clip(step_reward, -50.0, 100.0)
-
-        return self._get_obs(uz_current), step_reward, terminated, False, {"max_def_mm": current_max_def}
     def action_masks(self):
         mask = np.ones(self.n_candidates, dtype=bool)
         mask[list(self.occupied_indices)] = False
@@ -322,18 +366,60 @@ class SmartFixtureEnv3D(gym.Env):
     def _get_obs(self, uz_data):
         occupancy = np.zeros(self.n_candidates)
         occupancy[list(self.occupied_indices)] = 1.0
+        # tanh 平滑压缩：输出 ∈ (-1, 1)，与 observation_space 一致
+        uz_mm = uz_data * 1000.0
+        uz_scaled = np.tanh(uz_mm / 20.0).astype(np.float32)
 
-        # 🟢 [关键] 输入归一化 (Scaling)
-        # 将变形量 (米) 乘以 1000 变为 (毫米)，让数值在 0.1~10 之间
-        # 神经网络对这个范围的数值最敏感
-        uz_scaled = uz_data * 1000.0
+        # ---- 额外 10 维辅助信息 ----
+        # 使用 __init__ 中缓存的几何常量，避免热路径重复计算
+        def norm_x(v):
+            return (float(v) - self.x_min) / self.x_span  # → [0, 1]
 
-        return np.concatenate([uz_scaled, occupancy]).astype(np.float32)
+        def norm_y(v):
+            return (float(v) - self.y_min) / self.y_span
+
+        # locator2_xy: 2 个定位点的归一化 (x,y)，共 4 维
+        if self.last_locator2_points is not None and len(self.last_locator2_points) >= 2:
+            p2a = self.last_locator2_points[0]
+            p2b = self.last_locator2_points[1]
+            loc2_vec = np.array([
+                norm_x(p2a[0]), norm_y(p2a[1]),
+                norm_x(p2b[0]), norm_y(p2b[1]),
+            ], dtype=np.float32)
+        else:
+            loc2_vec = np.zeros(4, dtype=np.float32)
+
+        # locator1_xy: 1 个定位点的归一化 (x,y)，共 2 维
+        if self.last_locator1_point is not None:
+            p1 = self.last_locator1_point
+            loc1_vec = np.array([norm_x(p1[0]), norm_y(p1[1])], dtype=np.float32)
+        else:
+            loc1_vec = np.zeros(2, dtype=np.float32)
+
+        # hotspot_xy: 最大变形点归一化坐标，共 2 维
+        max_node_idx = int(np.argmax(np.abs(uz_data)))
+        hp = self.nodes[max_node_idx]
+        hotspot_vec = np.array([norm_x(hp[0]), norm_y(hp[1])], dtype=np.float32)
+
+        # max_def: 当前最大变形 (mm) 归一化到 [0, 1]，clip 上限 20 mm
+        max_def_norm = np.array(
+            [float(np.tanh(float(np.max(np.abs(uz_data))) * 1000.0 / 20.0))],
+            dtype=np.float32,
+        )
+
+        # step_ratio: 当前步占最大步数的比例
+        step_ratio = np.array(
+            [float(len(self.fixtures)) / float(self.target_n)],
+            dtype=np.float32,
+        )
+
+        return np.concatenate(
+            [uz_scaled, occupancy, loc2_vec, loc1_vec, hotspot_vec, max_def_norm, step_ratio]
+        ).astype(np.float32)
 
     def _solve_mdsm(self, active_fixtures, return_metrics=False):
         if self.constraint_mode == "n21":
             if not active_fixtures:
-                # 没有任何支撑点时的兜底
                 metrics = {
                     "uz": np.zeros(self.n_nodes),
                     "max_abs_uz_mm": 0.0,
@@ -343,26 +429,34 @@ class SmartFixtureEnv3D(gym.Env):
                 }
                 return metrics if return_metrics else metrics["uz"]
 
-            pts2, pts1, meta = select_21_locator_points(
-                env=self,
-                support_points=active_fixtures,
-                scheme=self.locator_scheme,
-                clearance=self.locator_clearance,
-                boundary_tol=self.boundary_tol
-            )
-            metrics = solve_mdsm_n21(
-                env=self,
-                support_points=active_fixtures,
-                locator2_points=pts2,
-                locator1_point=pts1,
-                locator_meta=meta,
-                penalty=self.penalty,
-                support_radius=self.support_radius,
-                locator_clearance=self.locator_clearance
-            )
+            try:
+                pts2, pts1, meta = select_21_locator_points(
+                    env=self,
+                    support_points=active_fixtures,
+                    scheme=self.locator_scheme,
+                    clearance=self.locator_clearance,
+                    boundary_tol=self.boundary_tol
+                )
+                metrics = solve_mdsm_n21(
+                    env=self,
+                    support_points=active_fixtures,
+                    locator2_points=pts2,
+                    locator1_point=pts1,
+                    locator_meta=meta,
+                    penalty=self.penalty,
+                    support_radius=self.support_radius,
+                    locator_clearance=self.locator_clearance
+                )
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"[n21] 定位点选择或物理求解失败: {e}") from e
+            if not isinstance(metrics, dict):
+                raise RuntimeError(
+                    f"solve_mdsm_n21 返回了非 dict 类型: {type(metrics)}，无法解析求解结果"
+                )
             return metrics if return_metrics else metrics["uz"]
         else:
-            # 兼容旧版的 "full" 刚性约束
             K_mod = self.K_base.copy()
             F_mod = self.F_base.copy()
             penalty = 1e15
@@ -378,15 +472,14 @@ class SmartFixtureEnv3D(gym.Env):
                                 F_mod[eq] = 0.0
             try:
                 U_vec = spsolve(K_mod, F_mod)
-            except:
-                U_vec = np.zeros(self.n_nodes)
+            except Exception as e:
+                raise RuntimeError(f"full 模式 spsolve 失败: {e}") from e
 
             uz_result = np.zeros(self.n_nodes)
             valid_mask = self.uz_map != -1
             uz_result[valid_mask] = U_vec[self.uz_map[valid_mask]]
 
             if return_metrics:
-                # 为了格式统一，造一个 metrics 字典
                 return {
                     "uz": uz_result,
                     "max_abs_uz_mm": float(np.max(np.abs(uz_result)) * 1000.0)

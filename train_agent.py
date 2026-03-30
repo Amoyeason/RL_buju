@@ -70,7 +70,7 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # 🟢 [建议] 增加到 50,000 步，让 AI 有足够时间探索大板布局
-TOTAL_TIMESTEPS = 50000
+TOTAL_TIMESTEPS = 10000
 
 def main():
     print("🚀 启动 3D 曲面训练任务 (Physics V43 Ready)...")

@@ -250,8 +250,7 @@ def solve_mdsm_n21(env, support_points, locator2_points, locator1_point, locator
     try:
         U_vec = spsolve(K_mod, F_mod)
     except Exception as e:
-        print(f"⚠️ spsolve failed: {e}")
-        return np.zeros(env.n_nodes, dtype=np.float64)
+        raise RuntimeError(f"solve_mdsm_n21 spsolve 失败: {e}") from e
 
     ux = np.zeros(env.n_nodes, dtype=np.float64)
     uy = np.zeros(env.n_nodes, dtype=np.float64)
