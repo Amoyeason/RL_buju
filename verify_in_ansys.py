@@ -16,7 +16,8 @@ from constraint_n21 import map_support_patches_to_ansys_nodes, map_locator_to_an
 # ================= 配置区域 =================
 DATA_DIR = "E:\\ansys_data_final"
 CAD_PATH = "E:\\ZJU\\Learning baogao\\0128.IGS"
-MODEL_PATH = "models_3d/final_model_3d"
+# MODEL_PATH = "models_3d/final_model_3d"
+MODEL_PATH = "models_3d/best/best_model"
 TARGET_N = 8
 
 # 必须与 extract_data 一致
@@ -204,12 +205,26 @@ def main():
         print(f"   📘 Python (AI): {ai_python_def:.6f} mm")
         print(f"   🟧 ANSYS (Real): {ansys_max_mm:.6f} mm")
 
-        # 硬编码人工基准值 (0.8054 mm)
-        manual_baseline = 0.8054
-        improvement = (manual_baseline - ansys_max_mm) / manual_baseline * 100
+        # 动态计算人工基准：用同一套 N-2-1 物理模型求解人工布局
+        print("   🔢 正在计算人工基准 (Python N-2-1)...")
+        manual_baseline = None
+        try:
+            from evaluate import get_smart_manual_baseline
+            man_fixtures = get_smart_manual_baseline(env)  # 返回 fixtures 列表
+            man_solution = env._solve_mdsm(man_fixtures, return_metrics=True)
+            manual_baseline = man_solution["max_abs_uz_mm"]
+            env.last_locator_meta    = man_solution.get("locator_meta")
+            env.last_locator2_points = man_solution.get("locator2_points")
+            env.last_locator1_point  = man_solution.get("locator1_point")
+        except Exception as e:
+            print(f"   ⚠️ 人工基准计算失败: {e}")
         print("-" * 20)
-        print(f"   🆚 对比人工基准 (0.8054 mm):")
-        print(f"   📈 提升幅度: {improvement:.2f}%")
+        if manual_baseline is not None:
+            improvement = (manual_baseline - ansys_max_mm) / manual_baseline * 100
+            print(f"   🆚 对比人工基准 (Python N-2-1): {manual_baseline:.4f} mm")
+            print(f"   📈 提升幅度: {improvement:.2f}%")
+        else:
+            print("   ⚠️ 人工基准不可用，跳过对比")
 
         # ================= 绘图 =================
         print("   🎨 正在生成结果云图...")

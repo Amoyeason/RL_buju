@@ -216,7 +216,7 @@ def main():
             shutil.copy(os.path.join(WORK_DIR, "manual_verify_job000.png"), "debug_manual_constraints.png")
 
         # --- C. 求解 ---
-        print("   🧮 求解中 (NLGEOM=ON)...")
+        print("   🧮 求解中 (NLGEOM=OFF)...")
         mapdl.nlgeom("OFF");
         mapdl.ncnv(2);
         mapdl.eqslv("SPARSE")

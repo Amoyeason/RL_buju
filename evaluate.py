@@ -12,7 +12,8 @@ from scipy.interpolate import griddata
 from scipy.spatial import KDTree
 
 # ================= 配置 =================
-MODEL_PATH = "models_3d/final_model_3d"
+# MODEL_PATH = "models_3d/final_model_3d"
+MODEL_PATH = "models_3d/best/best_model"
 DATA_DIR = "E:\\ansys_data_final"
 TARGET_N = 8
 

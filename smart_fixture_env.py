@@ -336,8 +336,8 @@ class SmartFixtureEnv3D(gym.Env):
         # ── B. 热点引导项 ─────────────────────────────────────────────
         # 与 dense reward 同量级（最高 ~2.5 分）
         reward_hotspot = 0.0
-        if dist_to_hotspot < 0.25:
-            reward_hotspot = 2.5 * (1.0 - dist_to_hotspot / 0.25)
+        # if dist_to_hotspot < 0.25:
+        #     reward_hotspot = 2.5 * (1.0 - dist_to_hotspot / 0.25)
 
         # ── C. 终局奖励（显著降权，避免喧宾夺主）────────────────────
         reward_terminal = 0.0
